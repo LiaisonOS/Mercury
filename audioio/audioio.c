@@ -71,6 +71,17 @@ cbuf_handle_t playback_buffer;
 int audio_subsystem;
 static int capture_input_channel_layout = LEFT;
 
+// TX output gain: 1.0 = full, 0.0 = silent. Set via TXLEVEL TCP command.
+#include <stdatomic.h>
+static _Atomic double tx_output_gain = 1.0;
+
+void audioio_set_tx_gain(double gain)
+{
+    if (gain < 0.0) gain = 0.0;
+    if (gain > 1.0) gain = 1.0;
+    atomic_store(&tx_output_gain, gain);
+}
+
 // Internal state for restart support
 static pthread_t s_radio_capture;
 static pthread_t s_radio_playback;
@@ -350,6 +361,13 @@ void *radio_playback_thread(void *device_ptr)
                 // Linear interpolation between current and next sample
                 buffer_upsampled[i * resample_ratio + j] = current + (next - current) * j / resample_ratio;
             }
+        }
+
+        // Apply TX output gain (set via TXLEVEL command — no PCM restart needed)
+        double gain = atomic_load(&tx_output_gain);
+        if (gain < 1.0) {
+            for (int i = 0; i < samples_upsampled; i++)
+                buffer_upsampled[i] = (int32_t)(buffer_upsampled[i] * gain);
         }
 
         // Convert upsampled mono to stereo

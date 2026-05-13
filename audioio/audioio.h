@@ -53,6 +53,9 @@ int rx_transfer(double *buffer, size_t len);
 
 void list_soundcards(int audio_system);
 
+// Set TX output gain: 1.0 = full, 0.0 = silent. Thread-safe, no PCM restart.
+void audioio_set_tx_gain(double gain);
+
 // Enumerate device names and IDs into caller-supplied buffers.
 // mode: 0 = FFAUDIO_DEV_PLAYBACK, 1 = FFAUDIO_DEV_CAPTURE
 // Returns the number of devices found (up to max_count).

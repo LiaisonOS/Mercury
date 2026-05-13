@@ -49,6 +49,9 @@
 #include "hermes_log.h"
 #include "radio_io.h"
 
+// TX gain control — set via TXLEVEL command, applied in audio playback thread
+extern void audioio_set_tx_gain(double gain);
+
 static pthread_t tid[7];
 static bool tid_started[7];
 static int arq_tcp_base_port_cfg = 0;
@@ -356,6 +359,21 @@ static void execute_control_command(char *buffer)
             tcp_write(CTL_TCP_PORT, (uint8_t *)"OK\r", 3);
         else
             tcp_write(CTL_TCP_PORT, (uint8_t *)"WRONG\r", 6);
+        return;
+    }
+
+    if (!memcmp(buffer, "TXLEVEL", strlen("TXLEVEL")))
+    {
+        // TXLEVEL <0-100>  — set TX output gain (100 = full, 0 = silent)
+        // Applied as a software multiplier in the audio playback thread.
+        // No PCM restart — safe to call during an active ARQ session.
+        int pct = -1;
+        if (sscanf(buffer, "TXLEVEL %d", &pct) == 1 && pct >= 0 && pct <= 100) {
+            audioio_set_tx_gain(pct / 100.0);
+            tcp_write(CTL_TCP_PORT, (uint8_t *)"OK\r", 3);
+        } else {
+            tcp_write(CTL_TCP_PORT, (uint8_t *)"WRONG\r", 6);
+        }
         return;
     }
 
