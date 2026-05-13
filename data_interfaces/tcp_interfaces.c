@@ -33,7 +33,10 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/un.h>
 #endif
+
+#define MERCURY_CTL_SOCK "/tmp/mercury-ctl.sock"
 
 #include "os_interop.h"
 
@@ -1282,6 +1285,94 @@ uint32_t tnc_get_last_bitrate_bps(void)
     return atomic_load_explicit(&last_bitrate_bps, memory_order_relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// Unix socket control thread — handles QtMercury commands (TXLEVEL, RETRIES,
+// CALLINT) without touching the ARQ TCP session on port 8300.
+// ---------------------------------------------------------------------------
+static void handle_ctl_sock_command(const char *buf)
+{
+    int pct = -1;
+    int val = -1;
+    arq_cmd_msg_t cmd;
+
+    if (sscanf(buf, "TXLEVEL %d", &pct) == 1 && pct >= 0 && pct <= 100) {
+        audioio_set_tx_gain(pct / 100.0);
+        HLOGI("ctl-sock", "TXLEVEL set to %d%%", pct);
+        return;
+    }
+    memset(&cmd, 0, sizeof(cmd));
+    if (sscanf(buf, "RETRIES %d", &val) == 1 && val >= 0) {
+        cmd.type = ARQ_CMD_SET_RETRY;
+        cmd.value = val;
+        arq_submit_tcp_cmd(&cmd);
+        HLOGI("ctl-sock", "RETRIES set to %d", val);
+        return;
+    }
+    memset(&cmd, 0, sizeof(cmd));
+    if (sscanf(buf, "CALLINT %d", &val) == 1 && val >= 0) {
+        cmd.type = ARQ_CMD_SET_CALLINT;
+        cmd.value = val;
+        arq_submit_tcp_cmd(&cmd);
+        HLOGI("ctl-sock", "CALLINT set to %d", val);
+        return;
+    }
+    HLOGW("ctl-sock", "Unknown command: %s", buf);
+}
+
+static void *unix_ctl_thread(void *arg)
+{
+    (void)arg;
+    int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        HLOGE("ctl-sock", "socket() failed");
+        return NULL;
+    }
+
+    unlink(MERCURY_CTL_SOCK);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, MERCURY_CTL_SOCK, sizeof(addr.sun_path) - 1);
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        HLOGE("ctl-sock", "bind() failed");
+        close(server_fd);
+        return NULL;
+    }
+    if (listen(server_fd, 4) < 0) {
+        HLOGE("ctl-sock", "listen() failed");
+        close(server_fd);
+        return NULL;
+    }
+
+    HLOGI("ctl-sock", "Unix control socket ready at %s", MERCURY_CTL_SOCK);
+
+    while (!shutdown_) {
+        struct pollfd pfd = { server_fd, POLLIN, 0 };
+        if (poll(&pfd, 1, 500) <= 0)
+            continue;
+
+        int client = accept(server_fd, NULL, NULL);
+        if (client < 0)
+            continue;
+
+        char buf[256] = {0};
+        ssize_t n = recv(client, buf, sizeof(buf) - 1, 0);
+        if (n > 0) {
+            buf[n] = '\0';
+            // Strip trailing \r\n
+            while (n > 0 && (buf[n-1] == '\r' || buf[n-1] == '\n'))
+                buf[--n] = '\0';
+            handle_ctl_sock_command(buf);
+        }
+        close(client);
+    }
+
+    close(server_fd);
+    unlink(MERCURY_CTL_SOCK);
+    return NULL;
+}
+
 int interfaces_init(int arq_tcp_base_port, int broadcast_tcp_port, size_t broadcast_frame_size)
 {
     arq_tcp_base_port_cfg = arq_tcp_base_port;
@@ -1328,7 +1419,12 @@ int interfaces_init(int arq_tcp_base_port, int broadcast_tcp_port, size_t broadc
     }
     tid_started[6] = true;
 
-    
+    /*************** Unix control socket (QtMercury) ***********************/
+    if (pthread_create(&tid[1], NULL, unix_ctl_thread, NULL) != 0)
+        HLOGW("ctl-sock", "Failed to start Unix control socket thread — QtMercury control unavailable");
+    else
+        tid_started[1] = true;
+
     return EXIT_SUCCESS;
 }
 
